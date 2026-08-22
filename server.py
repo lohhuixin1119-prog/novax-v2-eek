@@ -88,25 +88,35 @@ def do_arithmetic(operator: str, a: int, b: int) -> float:
 
 
 def _classify_shape(image_base64: str) -> str:
+    # Tolerate a data-URI prefix (e.g. "data:image/png;base64,...") in case
+    # the caller sends one instead of raw base64.
+    if "," in image_base64 and image_base64.strip().startswith("data:"):
+        image_base64 = image_base64.split(",", 1)[1]
+
     raw = base64.b64decode(image_base64)
     arr = np.frombuffer(raw, dtype=np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise ValueError("Could not decode image; expected a base64-encoded PNG.")
 
-    _, thresh = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY)
+    # Otsu's method picks the threshold from the image's own histogram instead
+    # of assuming pure black/white, so it copes with anti-aliasing, off-black
+    # or off-white fills, and mild compression artifacts.
+    _, thresh = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     img_area = img.shape[0] * img.shape[1]
 
-    # Shapes may be drawn dark-on-light or light-on-dark. Try both polarities
-    # and discard any contour that just traces the outer image frame (i.e. the
-    # background got picked up as "foreground").
+    # Shapes may be drawn dark-on-light or light-on-dark, and outlines can be
+    # thin strokes rather than filled regions. Try both polarities, discard
+    # any contour that just traces the outer image frame (background picked
+    # up as "foreground") or is too small to be the real shape, then pool
+    # candidates from BOTH polarities and take the single largest — a noise
+    # contour from the "wrong" polarity is reliably smaller than the real
+    # shape found under the correct polarity.
+    min_area = max(50, 0.005 * img_area)
     contours = []
     for candidate in (thresh, cv2.bitwise_not(thresh)):
         found, _ = cv2.findContours(candidate, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-        found = [c for c in found if 50 < cv2.contourArea(c) < 0.95 * img_area]
-        if found:
-            contours = found
-            break
+        contours.extend(c for c in found if min_area < cv2.contourArea(c) < 0.95 * img_area)
 
     if not contours:
         raise ValueError("No shape could be found in the image.")
